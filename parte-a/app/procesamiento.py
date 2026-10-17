@@ -1,20 +1,25 @@
-# procesamiento.py — Lógica de procesamiento en segundo plano (stub de Etapa 1).
+# procesamiento.py — Orquestador del pipeline de procesamiento de leads.
 #
-# En esta etapa solo registramos que el procesamiento fue "disparado".
-# Las etapas 2-7 irán llenando esta función con la lógica real.
+# Etapa 2: agrega validación, normalización y rechazo al pipeline.
+# Las etapas 3-7 seguirán agregando lógica en el bloque marcado "PIPELINE".
 #
-# Por qué un archivo separado y no todo en webhook.py:
-#   - Separación de responsabilidades: el webhook solo recibe y guarda;
-#     este módulo orquesta el pipeline completo.
-#   - Más fácil de testear: podemos probar el procesamiento sin levantar FastAPI.
-#   - El script reprocesar.py (Etapa 7) importará esta misma función.
+# Patrón de este módulo:
+#   1. Leer el raw_payload de la DB
+#   2. Parsear para obtener los datos del lead
+#   3. Validar/normalizar teléfono y correo
+#   4. Si ambos inválidos → rechazar con motivo
+#   5. Si al menos uno válido → marcar campos normalizados, estado=procesado (por ahora)
+#   6. En etapas siguientes: deduplicar, enriquecer, clasificar, enrutar
 
+import json
 import logging
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
 
 from app.database import engine, leads
+from app.modelos import EventoWebhook
+from app.normalizacion import validar_y_normalizar
 
 # Logger con nombre del módulo para filtrar en los logs
 logger = logging.getLogger(__name__)
@@ -25,53 +30,132 @@ async def procesar_lead(event_id: str) -> None:
     Punto de entrada del pipeline de procesamiento de un lead.
     Se ejecuta en segundo plano después de que el webhook ya respondió 200.
 
-    En Etapa 1: solo actualiza el timestamp de procesamiento como prueba
-    de que el background task se ejecutó.
-    Las etapas 2-7 agregarán: validación, deduplicación, enriquecimiento,
-    clasificación LLM y enrutado con avisos.
+    Etapa 2 agrega: validación y normalización de contacto, rechazo si
+    no hay ningún medio de contacto válido.
 
     Args:
         event_id: El identificador del evento a procesar.
     """
-    logger.info("Iniciando procesamiento del lead | event_id=%s", event_id)
+    logger.info("Iniciando procesamiento | event_id=%s", event_id)
 
     try:
-        async with engine.begin() as conn:
-            # Verificamos que el lead existe y está en estado pendiente.
-            # Un lead podría haber cambiado de estado si llegó duplicado.
+        # ── Leer el lead de la base de datos ─────────────────────────────────
+        async with engine.connect() as conn:
             fila = await conn.execute(
-                sa.select(leads.c.id, leads.c.estado)
+                sa.select(leads.c.id, leads.c.estado, leads.c.raw_payload)
                 .where(leads.c.event_id == event_id)
             )
             lead_row = fila.fetchone()
 
-            if not lead_row:
-                # No debería pasar: lo guardamos justo antes de llamar esto
-                logger.error("Lead no encontrado en DB | event_id=%s", event_id)
-                return
+        if not lead_row:
+            logger.error("Lead no encontrado en DB | event_id=%s", event_id)
+            return
 
-            if lead_row.estado != "pendiente":
-                # Ya fue procesado por otro worker (carrera resuelta por UNIQUE)
-                logger.info(
-                    "Lead ya procesado, omitiendo | event_id=%s estado=%s",
-                    event_id,
-                    lead_row.estado,
-                )
-                return
-
-            # ── Aquí irá la lógica real en etapas 2-7 ────────────────────────
-            # Por ahora solo marcamos que el background task corrió.
-            # En Etapa 2 esto se reemplaza con validación + normalización.
+        if lead_row.estado != "pendiente":
+            # Ya procesado (race condition resuelta por UNIQUE en Etapa 1)
             logger.info(
-                "Lead listo para pipeline completo (stub Etapa 1) | event_id=%s",
-                event_id,
+                "Lead ya procesado, omitiendo | event_id=%s estado=%s",
+                event_id, lead_row.estado,
             )
+            return
+
+        # ── Parsear el payload original ───────────────────────────────────────
+        # Usamos el raw guardado en Etapa 1, no lo que llegó por HTTP,
+        # porque el background task no tiene acceso al request original.
+        try:
+            data = json.loads(lead_row.raw_payload)
+            evento = EventoWebhook.model_validate(data)
+        except Exception as exc:
+            # Si el payload es irrecuperable, marcamos como fallido
+            logger.warning("No se pudo reparsear payload | event_id=%s: %s", event_id, exc)
+            await _marcar_fallido(event_id, f"Payload irrecuperable: {exc}")
+            return
+
+        # Extraer datos del lead (con defaults seguros si vienen None)
+        lead_data = evento.lead
+        telefono_raw = lead_data.phone if lead_data else None
+        email_raw = lead_data.email if lead_data else None
+
+        # ── ETAPA 2: Validación y normalización ───────────────────────────────
+        resultado = validar_y_normalizar(telefono_raw, email_raw)
+
+        if resultado.debe_rechazarse:
+            # Sin ningún medio de contacto válido → rechazado (no se puede contactar)
+            logger.info(
+                "Lead rechazado sin contacto válido | event_id=%s", event_id
+            )
+            await _actualizar_lead(event_id, {
+                "estado": "rechazado",
+                "motivo": resultado.motivo_rechazo,
+                "telefono_e164": None,
+                "email_normalizado": None,
+                "telefono_invalido": True,
+                "email_invalido": True,
+                "processed_at": datetime.now(timezone.utc),
+            })
+            return
+
+        # ── PIPELINE (etapas 3-7 se insertan aquí) ────────────────────────────
+        # Por ahora marcamos procesado con los campos normalizados.
+        # Etapa 3 añadirá deduplicación, Etapa 4 enriquecimiento, etc.
+        logger.info(
+            "Lead normalizado | event_id=%s tel=%s email=%s",
+            event_id,
+            # Enmascaramos el teléfono en logs (cumplimiento LOPDP)
+            _enmascarar_tel(resultado.telefono_e164),
+            resultado.email_normalizado,
+        )
+
+        await _actualizar_lead(event_id, {
+            "estado": "procesado",       # Se sobreescribirá en etapas siguientes
+            "telefono_e164": resultado.telefono_e164,
+            "email_normalizado": resultado.email_normalizado,
+            "telefono_invalido": resultado.telefono_invalido,
+            "email_invalido": resultado.email_invalido,
+            "processed_at": datetime.now(timezone.utc),
+        })
 
     except Exception as exc:
-        # En Etapa 7 habrá manejo centralizado de errores con avisos.
-        # Por ahora solo logueamos para no perder el error.
+        # Captura cualquier error no esperado y lo registra
+        # En Etapa 7 habrá avisos automáticos cuando esto ocurra
         logger.exception(
-            "Error inesperado en procesamiento | event_id=%s error=%s",
-            event_id,
-            str(exc),
+            "Error inesperado en procesamiento | event_id=%s: %s",
+            event_id, str(exc),
         )
+        await _marcar_fallido(event_id, f"Error interno: {exc}")
+
+
+# ── Helpers privados ──────────────────────────────────────────────────────────
+
+async def _actualizar_lead(event_id: str, campos: dict) -> None:
+    """Actualiza campos del lead en la base de datos."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            sa.update(leads)
+            .where(leads.c.event_id == event_id)
+            .values(**campos)
+        )
+
+
+async def _marcar_fallido(event_id: str, motivo: str) -> None:
+    """
+    Marca el lead como fallido para que el script reprocesar.py lo retome.
+    Estado 'fallido' = se aceptó el lead pero algo salió mal en el pipeline.
+    """
+    await _actualizar_lead(event_id, {
+        "estado": "fallido",
+        "motivo": motivo,
+        "processed_at": datetime.now(timezone.utc),
+    })
+
+
+def _enmascarar_tel(telefono: str | None) -> str:
+    """
+    Enmascara el teléfono para logs: +593****4567
+    Cumple con la regla de privacidad LOPDP del enunciado:
+    'en los logs, enmascara el teléfono'.
+    """
+    if not telefono or len(telefono) < 7:
+        return "****"
+    # Muestra código de país y últimos 4 dígitos
+    return f"{telefono[:4]}****{telefono[-4:]}"
