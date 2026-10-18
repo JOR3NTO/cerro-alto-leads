@@ -14,7 +14,7 @@
 #   - SQLAlchemy Core nos da type hints, migrations futuras y protección
 #     contra SQL injection de forma natural.
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -96,7 +96,7 @@ leads = sa.Table(
         "created_at",
         sa.DateTime,
         nullable=False,
-        default=datetime.utcnow,
+        default=lambda: datetime.now(timezone.utc),
         server_default=sa.func.current_timestamp(),
     ),
     sa.Column("processed_at", sa.DateTime, nullable=True),

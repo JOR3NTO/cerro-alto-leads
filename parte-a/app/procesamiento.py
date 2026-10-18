@@ -21,6 +21,7 @@ from app.database import engine, leads
 from app.deduplicacion import buscar_duplicado_db
 from app.modelos import EventoWebhook
 from app.normalizacion import validar_y_normalizar
+from app.clasificacion import clasificar_lead
 from app.pacientes import enriquecer_lead
 
 # Logger con nombre del módulo para filtrar en los logs
@@ -177,11 +178,32 @@ async def procesar_lead(event_id: str) -> None:
             "enriquecimiento_pendiente": resultado_enriq.enriquecimiento_pendiente,
         })
 
-        # ── PIPELINE (etapas 5-7 se insertan aquí) ────────────────────────────
-        # Por ahora marcamos procesado si no fue duplicado.
-        # Etapa 5 añadirá clasificación LLM, Etapa 6 enrutado y avisos, etc.
+        # ── ETAPA 5: Clasificación de intención con LLM y reglas duras ────────
+        # 1. Tratamiento activo en CRM → caliente
+        # 2. Urgencia clínica / dolor dental → caliente
+        # 3. LLM (Gemini 1.5 Flash) → caliente / tibio / basura
+        # Regla de oro: si el LLM falla o no hay API key, degrada a tibio, nunca a basura.
+        mensaje_lead = lead_data.message if lead_data else None
+        servicio_interes = lead_data.service_interest if lead_data else None
+        campana = evento.source.campaign if evento.source else None
+
+        clasificacion = await clasificar_lead(
+            mensaje=mensaje_lead,
+            service_interest=servicio_interes,
+            campaign=campana,
+            tiene_tratamiento_activo=resultado_enriq.tiene_tratamiento_activo,
+        )
+
+        logger.info(
+            "Clasificacion final | event_id=%s ruta=%s motivo=%s",
+            event_id, clasificacion.ruta, clasificacion.motivo,
+        )
+
+        # ── Guardar clasificación en base de datos ────────────────────────────
         await _actualizar_lead(event_id, {
-            "estado": "procesado",       # Se sobreescribirá en etapas siguientes
+            "estado": "procesado",
+            "ruta": clasificacion.ruta,
+            "motivo": clasificacion.motivo,
             "processed_at": datetime.now(timezone.utc),
         })
 
