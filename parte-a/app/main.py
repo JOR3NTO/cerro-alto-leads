@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.database import close_db, init_db
 from app.webhook import router as webhook_router
+from app.estado import router as estado_router
 
 
 # ── Configuración de logging ─────────────────────────────────────────────────
@@ -58,8 +59,9 @@ app = FastAPI(
 )
 
 # ── Registro de routers ───────────────────────────────────────────────────────
-# El webhook vive en /webhook; en Etapa 8 agregaremos /leads/estado
+# Webhook de entrada de leads y consulta de estado del pipeline
 app.include_router(webhook_router)
+app.include_router(estado_router)
 
 
 # ── Ruta de salud ─────────────────────────────────────────────────────────────

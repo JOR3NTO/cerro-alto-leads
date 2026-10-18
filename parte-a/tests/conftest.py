@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 import app.database as db_module
 import app.webhook as webhook_module
 import app.procesamiento as procesamiento_module
+import app.estado as estado_module
 
 # ── Base de datos temporal con WAL mode para tests ───────────────────────────
 # Usamos un archivo temporal en disco (en vez de :memory: puro) porque SQLite
@@ -45,6 +46,7 @@ _test_engine = create_async_engine(
 db_module.engine = _test_engine
 webhook_module.engine = _test_engine
 procesamiento_module.engine = _test_engine
+estado_module.engine = _test_engine
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
