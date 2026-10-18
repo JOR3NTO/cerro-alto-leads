@@ -91,6 +91,13 @@ leads = sa.Table(
     # motivo es obligatorio para duplicado, rechazado, fallido y basura
     sa.Column("motivo", sa.Text, nullable=True),
 
+    # ── Enrutado y avisos a recepción (Etapa 6) ───────────────────────────────
+    # notificacion_enviada: True si se notificó con éxito a recepción (< 5 min SLA)
+    sa.Column("notificacion_enviada", sa.Boolean, nullable=False, server_default="0"),
+    sa.Column("notificacion_canal", sa.String, nullable=True),
+    # borrador_seguimiento: plantilla de respuesta lista para leads tibios (no auto-enviada)
+    sa.Column("borrador_seguimiento", sa.Text, nullable=True),
+
     # ── Timestamps ───────────────────────────────────────────────────────────
     sa.Column(
         "created_at",

@@ -22,6 +22,7 @@ from app.deduplicacion import buscar_duplicado_db
 from app.modelos import EventoWebhook
 from app.normalizacion import validar_y_normalizar
 from app.clasificacion import clasificar_lead
+from app.enrutado import enrutar_lead
 from app.pacientes import enriquecer_lead
 
 # Logger con nombre del módulo para filtrar en los logs
@@ -199,11 +200,34 @@ async def procesar_lead(event_id: str) -> None:
             event_id, clasificacion.ruta, clasificacion.motivo,
         )
 
-        # ── Guardar clasificación en base de datos ────────────────────────────
+        # ── ETAPA 6: Enrutado operativo y avisos a recepción ──────────────────
+        # - caliente: aviso inmediato a recepción (< 5 min SLA)
+        # - tibio: genera borrador de seguimiento personalizado
+        # - basura: descarte silencioso con motivo auditable
+        datos_enrutado = await enrutar_lead(
+            ruta=clasificacion.ruta,
+            event_id=event_id,
+            nombre=lead_data.full_name if lead_data else None,
+            telefono_e164=resultado.telefono_e164,
+            email=resultado.email_normalizado,
+            servicio=servicio_interes,
+            campana=campana,
+            plataforma=evento.source.platform if evento.source else None,
+            mensaje=mensaje_lead,
+            es_paciente_existente=resultado_enriq.es_paciente_existente,
+            tiene_tratamiento_activo=resultado_enriq.tiene_tratamiento_activo,
+            lead_id=resultado_enriq.lead_id,
+            motivo=clasificacion.motivo,
+        )
+
+        # ── Guardar clasificación y enrutado en base de datos ─────────────────
         await _actualizar_lead(event_id, {
             "estado": "procesado",
             "ruta": clasificacion.ruta,
             "motivo": clasificacion.motivo,
+            "notificacion_enviada": datos_enrutado.get("notificacion_enviada", False),
+            "notificacion_canal": datos_enrutado.get("notificacion_canal"),
+            "borrador_seguimiento": datos_enrutado.get("borrador_seguimiento"),
             "processed_at": datetime.now(timezone.utc),
         })
 
