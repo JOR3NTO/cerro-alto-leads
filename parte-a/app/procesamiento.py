@@ -21,6 +21,7 @@ from app.database import engine, leads
 from app.deduplicacion import buscar_duplicado_db
 from app.modelos import EventoWebhook
 from app.normalizacion import validar_y_normalizar
+from app.pacientes import enriquecer_lead
 
 # Logger con nombre del módulo para filtrar en los logs
 logger = logging.getLogger(__name__)
@@ -150,9 +151,35 @@ async def procesar_lead(event_id: str) -> None:
             })
             return  # Detenemos pipeline: no llamamos a API pacientes, ni LLM, ni avisos
 
-        # ── PIPELINE (etapas 4-7 se insertan aquí) ────────────────────────────
+        # ── ETAPA 4: Enriquecimiento con API de Pacientes ──────────────────────
+        # Consultamos el CRM externo para saber si ya es paciente registrado y si
+        # tiene tratamientos activos o pendientes (clave para clasificarlo como CALIENTE).
+        nombre_lead = lead_data.full_name if lead_data else None
+        resultado_enriq = await enriquecer_lead(
+            telefono_e164=resultado.telefono_e164,
+            email=resultado.email_normalizado,
+            nombre_lead=nombre_lead,
+        )
+
+        logger.info(
+            "Enriquecimiento completado | event_id=%s es_paciente=%s activo=%s pendiente=%s lead_id=%s",
+            event_id,
+            resultado_enriq.es_paciente_existente,
+            resultado_enriq.tiene_tratamiento_activo,
+            resultado_enriq.enriquecimiento_pendiente,
+            resultado_enriq.lead_id,
+        )
+
+        await _actualizar_lead(event_id, {
+            "es_paciente_existente": resultado_enriq.es_paciente_existente,
+            "tiene_tratamiento_activo": resultado_enriq.tiene_tratamiento_activo,
+            "lead_id": resultado_enriq.lead_id,
+            "enriquecimiento_pendiente": resultado_enriq.enriquecimiento_pendiente,
+        })
+
+        # ── PIPELINE (etapas 5-7 se insertan aquí) ────────────────────────────
         # Por ahora marcamos procesado si no fue duplicado.
-        # Etapa 4 añadirá enriquecimiento, Etapa 5 clasificación LLM, etc.
+        # Etapa 5 añadirá clasificación LLM, Etapa 6 enrutado y avisos, etc.
         await _actualizar_lead(event_id, {
             "estado": "procesado",       # Se sobreescribirá en etapas siguientes
             "processed_at": datetime.now(timezone.utc),

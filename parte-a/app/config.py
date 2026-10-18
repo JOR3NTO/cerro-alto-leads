@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
 
     model_config = SettingsConfigDict(
-        # Busca el .env dos niveles arriba de parte-a/app/ → raíz del repo
-        env_file="../../.env",
+        # Busca el .env tanto en el directorio actual como un nivel arriba (raíz del repo)
+        env_file=(".env", "../.env"),
         env_file_encoding="utf-8",
         # Permite variables extra en el .env sin que lancen error
         extra="ignore",
