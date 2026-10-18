@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import sqlalchemy as sa
 
 from app.database import engine, leads
+from app.deduplicacion import buscar_duplicado_db
 from app.modelos import EventoWebhook
 from app.normalizacion import validar_y_normalizar
 
@@ -42,7 +43,12 @@ async def procesar_lead(event_id: str) -> None:
         # ── Leer el lead de la base de datos ─────────────────────────────────
         async with engine.connect() as conn:
             fila = await conn.execute(
-                sa.select(leads.c.id, leads.c.estado, leads.c.raw_payload)
+                sa.select(
+                    leads.c.id,
+                    leads.c.estado,
+                    leads.c.raw_payload,
+                    leads.c.created_at,
+                )
                 .where(leads.c.event_id == event_id)
             )
             lead_row = fila.fetchone()
@@ -95,9 +101,7 @@ async def procesar_lead(event_id: str) -> None:
             })
             return
 
-        # ── PIPELINE (etapas 3-7 se insertan aquí) ────────────────────────────
-        # Por ahora marcamos procesado con los campos normalizados.
-        # Etapa 3 añadirá deduplicación, Etapa 4 enriquecimiento, etc.
+        # ── ETAPA 2: Guardar campos normalizados ──────────────────────────────
         logger.info(
             "Lead normalizado | event_id=%s tel=%s email=%s",
             event_id,
@@ -106,12 +110,51 @@ async def procesar_lead(event_id: str) -> None:
             resultado.email_normalizado,
         )
 
+        # Guardamos teléfono y email normalizados en la DB de inmediato.
+        # Por qué aquí: si entra otro lead en paralelo de la misma persona,
+        # ambos tendrán ya los datos normalizados visibles en DB para cotejarse.
         await _actualizar_lead(event_id, {
-            "estado": "procesado",       # Se sobreescribirá en etapas siguientes
             "telefono_e164": resultado.telefono_e164,
             "email_normalizado": resultado.email_normalizado,
             "telefono_invalido": resultado.telefono_invalido,
             "email_invalido": resultado.email_invalido,
+        })
+
+        # ── ETAPA 3: Deduplicación por persona (ventana 30 días) ───────────────
+        # Si la persona ya registró un lead con el mismo teléfono o correo
+        # en los últimos 30 días, se marca como duplicado y se detiene el flujo.
+        es_duplicado, event_id_original, campo_match = await buscar_duplicado_db(
+            engine=engine,
+            event_id_actual=event_id,
+            id_actual=lead_row.id,
+            created_at_actual=lead_row.created_at,
+            telefono_e164=resultado.telefono_e164,
+            email=resultado.email_normalizado,
+            dias_ventana=30,
+        )
+
+        if es_duplicado:
+            motivo = (
+                f"Lead duplicado por {campo_match} dentro de ventana de 30 dias "
+                f"(original: {event_id_original})"
+            )
+            logger.info(
+                "Lead duplicado detectado | event_id=%s duplicado_de=%s motivo=%s",
+                event_id, event_id_original, motivo,
+            )
+            await _actualizar_lead(event_id, {
+                "estado": "duplicado",
+                "duplicado_de": event_id_original,
+                "motivo": motivo,
+                "processed_at": datetime.now(timezone.utc),
+            })
+            return  # Detenemos pipeline: no llamamos a API pacientes, ni LLM, ni avisos
+
+        # ── PIPELINE (etapas 4-7 se insertan aquí) ────────────────────────────
+        # Por ahora marcamos procesado si no fue duplicado.
+        # Etapa 4 añadirá enriquecimiento, Etapa 5 clasificación LLM, etc.
+        await _actualizar_lead(event_id, {
+            "estado": "procesado",       # Se sobreescribirá en etapas siguientes
             "processed_at": datetime.now(timezone.utc),
         })
 

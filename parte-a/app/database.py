@@ -27,7 +27,7 @@ from app.config import settings
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
 )
 
 metadata = sa.MetaData()
@@ -70,8 +70,8 @@ leads = sa.Table(
     sa.Column("raw_payload", sa.Text, nullable=False),
 
     # ── Campos normalizados (se rellenan en la etapa de validación) ───────────
-    sa.Column("telefono_e164", sa.String, nullable=True),
-    sa.Column("email_normalizado", sa.String, nullable=True),
+    sa.Column("telefono_e164", sa.String, nullable=True, index=True),
+    sa.Column("email_normalizado", sa.String, nullable=True, index=True),
 
     # Indica si el teléfono o correo original era inválido pero el otro sí valió
     sa.Column("telefono_invalido", sa.Boolean, nullable=False, server_default="0"),
@@ -115,9 +115,12 @@ leads = sa.Table(
 async def init_db() -> None:
     """
     Crea las tablas si no existen. Se llama una vez al arrancar FastAPI.
-    'checkfirst=True' evita errores si la tabla ya existe (reinicios seguros).
+    Configura WAL (Write-Ahead Logging) y busy_timeout para permitir lecturas
+    concurrentes y serialización segura de escrituras bajo carga.
     """
     async with engine.begin() as conn:
+        await conn.execute(sa.text("PRAGMA journal_mode=WAL;"))
+        await conn.execute(sa.text("PRAGMA busy_timeout=30000;"))
         await conn.run_sync(metadata.create_all, checkfirst=True)
 
 
